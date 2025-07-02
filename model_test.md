@@ -68,45 +68,63 @@ if __name__ == "__main__":
 
 #### 3.1 モデル変換（Keras → TFLite）
 
-```bash
-# 事前に mobilenet_v3_small.h5 や EfficientNet-Lite0 を Kerasで用意しておく
-tflite_convert \
-  --keras_model_file=efficientnet_lite0.h5 \
-  --output_file=efficientnet_lite0.tflite \
-  --optimizations=OPTIMIZE_FOR_SIZE \
-  --representative_dataset=calib.py
 ```
 
 #### 3.2 推論コード（tflite-runtime）
-
-```python
+import tensorflow as tf
 import numpy as np
 from PIL import Image
-import tflite_runtime.interpreter as tflite
+from tensorflow.keras.applications.efficientnet import preprocess_input, decode_predictions
+# 新 import
+from tensorflow.lite.python.interpreter import Interpreter
 
+
+
+# ─── モデル変換（1度だけ実行） ─────────────────────────
+# EfficientNetB0 をロードして TFLite 化
+model = tf.keras.applications.EfficientNetB0(
+    weights='imagenet',
+    input_shape=(224, 224, 3),
+    include_top=True
+)
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+# 代表データなしでも最適化
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+tflite_model = converter.convert()
+with open("efficientnet_b0_int8.tflite", "wb") as f:
+    f.write(tflite_model)
+print("TFLite モデルを出力しました: efficientnet_b0_int8.tflite")
+
+
+# ─── 推論＋デコード ────────────────────────────────────
 # インタプリタ初期化
-interpreter = tflite.Interpreter(model_path="efficientnet_lite0.tflite")
+interpreter = Interpreter(model_path="efficientnet_b0_int8.tflite")
 interpreter.allocate_tensors()
 
-# 入力／出力テンソル情報
 input_details  = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-def predict_efficientnet_lite0(img_path: str):
-    img = Image.open(img_path).resize(
+def predict_tflite(img_path: str, top_k=3):
+    # 1. 画像読み込み＋リサイズ
+    img = Image.open(img_path).convert("RGB").resize(
         (input_details[0]['shape'][2], input_details[0]['shape'][1])
     )
-    x = np.array(img, dtype=np.float32) / 255.0
-    x = np.expand_dims(x, axis=0)
+    # 2. 前処理 (EfficientNet 用)
+    x = np.array(img, dtype=np.float32)
+    x = preprocess_input(x)              # [0,255]→[0,1]
+    x = np.expand_dims(x, axis=0)        # (1,224,224,3)
+    # 3. 推論
     interpreter.set_tensor(input_details[0]['index'], x)
     interpreter.invoke()
-    preds = interpreter.get_tensor(output_details[0]['index'])
-    return preds[0]  # 後処理(decoding)は必要に応じて
+    preds = interpreter.get_tensor(output_details[0]['index'])  # (1,1000)
+    # 4. Keras のデコード関数で人間向けに変換
+    decoded = decode_predictions(preds, top=top_k)[0]
+    return decoded
 
 if __name__ == "__main__":
-    scores = predict_efficientnet_lite0("test.jpg")
-    top_idx = scores.argsort()[-3:][::-1]
-    print("Top-3 indices:", top_idx, "scores:", scores[top_idx])
+    for name, label, prob in predict_tflite("image.png", top_k=5):
+        print(f"{label}: {prob:.4f}")
+
 ```
 
 ---
