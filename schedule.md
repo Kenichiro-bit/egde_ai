@@ -205,3 +205,103 @@ benchmark(model_200, val_loader_200, device="cpu")
 * `model_fn` を TFLite 版に変えれば同じベンチマークができます（`mobilenet_v3_small` 部分を `run_tflite` 関数に差し替えてください）。
 
 これをベースに、クラス数やモデルを変えつつ「速度 vs 精度」の比較を進めてみてください！
+
+
+はい。**既存の ImageNet（1000 クラス）モデルをそのまま 10 クラスのデータに当てるだけでは、精度はあまり上がりません**。10 クラス用のデータセット（Imagenette）で再学習（ファインチューニング）することで、モデルはその 10 クラスの特徴をよりよく捉えられるようになります。
+
+以下は PyTorch でのファインチューニング例です。流れとしては、
+
+1. 事前学習済みのモデルをロード
+2. 出力層を 10 クラス用に置き換え
+3. 最初は出力層のみ学習（他は凍結）
+4. 慣れてきたら全層を微小学習率で微調整
+
+というステップで進めます。
+
+```python
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
+from torchvision.models import mobilenet_v3_small
+
+# 1) データ準備
+transform = transforms.Compose([
+    transforms.Resize((160,160)),  # Imagenette の元サイズ
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+
+train_ds = ImageFolder("data/imagenette2-160/train", transform=transform)
+val_ds   = ImageFolder("data/imagenette2-160/val",   transform=transform)
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4)
+val_loader   = DataLoader(val_ds,   batch_size=32, shuffle=False, num_workers=4)
+
+# 2) モデル準備
+model = mobilenet_v3_small(pretrained=True)
+# 出力層を置き換え (1000→10)
+model.classifier[3] = nn.Linear(model.classifier[3].in_features, 10)
+
+# 3) 最初は出力層のみ学習
+for param in model.parameters():
+    param.requires_grad = False
+for param in model.classifier[3].parameters():
+    param.requires_grad = True
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = Adam(model.classifier[3].parameters(), lr=1e-3)
+
+# 4) 出力層ファインチューニング
+for epoch in range(3):
+    model.train()
+    total, correct = 0, 0
+    for imgs, labels in train_loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(imgs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        preds = outputs.argmax(1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+    print(f"[Head Only] Epoch {epoch}  Acc: {correct/total:.3f}")
+
+# 5) 全層アンロックして微調整
+for param in model.parameters():
+    param.requires_grad = True
+optimizer = Adam(model.parameters(), lr=1e-4)
+
+for epoch in range(5):
+    model.train()
+    total, correct = 0, 0
+    for imgs, labels in train_loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(imgs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        preds = outputs.argmax(1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+    print(f"[Fine-tune] Epoch {epoch}  Acc: {correct/total:.3f}")
+```
+
+* **出力層のみ学習** → 最初の 3 エポックで高速に 10 クラスの粗い適合を行います。
+* **全層微調整** → 残りの層も小さい学習率で動かし、より細かな特徴を調整します。
+
+学習後は、改めてベンチマーク（ステップ1で作った関数）で速度と精度を測定しましょう。
+
+> **まとめ**
+>
+> * **必ず再学習（ファインチューニング）** して、モデルを 10 クラス用に最適化する
+> * まずは出力層だけ、慣れてきたら全層微調整するのがおすすめ
+> * 学習後はベンチマークを回し、精度／速度のバランスを確認
+
+この流れで進めてみてください！質問やつまずいた点があれば教えてくださいね。
